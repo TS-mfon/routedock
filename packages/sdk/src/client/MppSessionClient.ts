@@ -230,14 +230,18 @@ export class MppSessionClient {
         }
 
         const concurrency = Math.max(1, options?.concurrency ?? 1)
+        const abortController = new AbortController()
 
         // Shared fetch-one helper — retries on transient errors.
         const doFetch = (): Promise<unknown> =>
           withRetry(async () => {
             let resp: Response
             try {
-              resp = await mppx.fetch(url)
+              resp = await mppx.fetch(url, { signal: abortController.signal })
             } catch (err) {
+              if (abortController.signal.aborted) {
+                throw err
+              }
               throw wrapFetchError(err, 'Voucher request')
             }
             if (!resp.ok) {
@@ -265,11 +269,15 @@ export class MppSessionClient {
           // Default: strictly sequential.
           // The next voucher is not issued until the provider returns HTTP 200
           // for the current one, preventing out-of-order sequence numbers.
-          while (true) {
-            await checkSpend()
-            const data = await doFetch()
-            vouchersIssued++
-            yield data
+          try {
+            while (true) {
+              await checkSpend()
+              const data = await doFetch()
+              vouchersIssued++
+              yield data
+            }
+          } finally {
+            abortController.abort()
           }
         } else {
           // Pipelined: maintain a sliding window of `concurrency` in-flight
@@ -296,7 +304,12 @@ export class MppSessionClient {
               yield data
             }
           } finally {
-            await Promise.allSettled(queue)
+            abortController.abort()
+            // Bound cleanup so hanging requests cannot stall consumer loop indefinitely
+            await Promise.race([
+              Promise.allSettled(queue),
+              new Promise((resolve) => setTimeout(resolve, 3000)),
+            ])
             queue.length = 0
           }
         }

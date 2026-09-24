@@ -1,7 +1,8 @@
 /**
  * Unit tests for MppSessionClient.stream() pipelined unhandled rejection handling (#397).
  *
- * Follows the mocking style in stream-backpressure.test.ts.
+ * Directly exercises MppSessionClient by intercepting globalThis.fetch to simulate
+ * in-flight voucher request rejections and consumer loop cancellations.
  *
  * Verifies:
  *   1. With concurrency: 3, a mocked fetch where slot 2 rejects before slot 1 resolves
@@ -16,7 +17,9 @@
  */
 
 import assert from 'node:assert/strict'
-import type { StreamOptions } from '../../types.js'
+import { Keypair } from '@stellar/stellar-sdk'
+import { MppSessionClient } from '../MppSessionClient.js'
+import type { RouteDockManifest } from '../../types.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -31,259 +34,289 @@ function deferred<T = unknown>(): {
     resolve = res
     reject = rej
   })
+  // Pre-catch mock deferred so the mock itself doesn't trigger unhandledRejection
+  promise.catch(() => {})
   return { promise, resolve, reject }
 }
 
-/**
- * Build a mock stream reproducing MppSessionClient.stream() with pipelined
- * unhandled rejection safety and spend checking.
- */
-function buildMockStream(
-  fetchFn: () => Promise<unknown>,
-  onSpend?: (amount: string) => Promise<void>,
-) {
-  let vouchersIssued = 0
+const clientKeypair = Keypair.random()
+const commitmentKeypair = Keypair.random()
+const client = new MppSessionClient(clientKeypair, 'testnet', { maxAttempts: 1 })
 
-  return {
-    vouchersIssued: () => vouchersIssued,
-    async *stream(options?: StreamOptions): AsyncIterable<unknown> {
-      const concurrency = Math.max(1, options?.concurrency ?? 1)
-      const doFetch = () => fetchFn()
-      const checkSpend = (): Promise<void> => {
-        if (!onSpend) return Promise.resolve()
-        return onSpend('0.0001')
-      }
-
-      if (concurrency === 1) {
-        while (true) {
-          await checkSpend()
-          const data = await doFetch()
-          vouchersIssued++
-          yield data
-        }
-      } else {
-        const queue: Array<Promise<unknown>> = []
-        try {
-          for (let i = 0; i < concurrency; i++) {
-            await checkSpend()
-            const p = doFetch()
-            p.catch(() => {})
-            queue.push(p)
-          }
-
-          while (true) {
-            const data = await queue.shift()!
-            // Replenish the window immediately after draining one slot.
-            await checkSpend()
-            const p = doFetch()
-            p.catch(() => {})
-            queue.push(p)
-            vouchersIssued++
-            yield data
-          }
-        } finally {
-          await Promise.allSettled(queue)
-          queue.length = 0
-        }
-      }
+const manifest: RouteDockManifest = {
+  version: '1',
+  name: 'test-agent',
+  payee: Keypair.random().publicKey(),
+  pricing: {
+    'mpp-session': {
+      rate: '0.0001',
+      per: 'voucher',
+      channel_factory: 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH',
+      min_deposit: '0.10',
+      refund_waiting_period_ledgers: 17280,
     },
-  }
+  },
 }
 
-// ── Test Runner with unhandledRejection tracking ───────────────────────────────
+function makeOkResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+}
 
-async function runTest(
-  name: string,
-  fn: (unhandled: unknown[]) => Promise<void>,
-) {
-  const unhandled: unknown[] = []
-  const listener = (reason: unknown) => {
-    unhandled.push(reason)
-  }
-  process.on('unhandledRejection', listener)
+// ── Test Runner ───────────────────────────────────────────────────────────────
+
+async function runTests() {
+  const originalFetch = globalThis.fetch
 
   try {
-    await fn(unhandled)
-    // Small delay to allow any unhandled rejections to be noticed by Node
-    await new Promise((r) => setTimeout(r, 20))
-    assert.strictEqual(
-      unhandled.length,
-      0,
-      `Expected 0 unhandledRejection events, found ${unhandled.length}: ${JSON.stringify(unhandled)}`,
-    )
-    console.log(`✓ ${name}`)
+    // ── Test 1 ─────────────────────────────────────────────────────────────────
+    // Concurrency 3: slot 2 rejects BEFORE slot 1 resolves.
+    // Consumer must receive slot 1 then slot 2 error.
+    // 0 unhandledRejection events.
+    {
+      const unhandled: unknown[] = []
+      const onUnhandled = (reason: unknown) => unhandled.push(reason)
+      process.on('unhandledRejection', onUnhandled)
+
+      const d1 = deferred<Response>()
+      const d2 = deferred<Response>()
+      const d3 = deferred<Response>()
+      const defs = [d1, d2, d3]
+      let callCount = 0
+
+      globalThis.fetch = async () => {
+        const d = defs[callCount++] ?? deferred<Response>()
+        return d.promise
+      }
+
+      const handle = await client.openSession(
+        'http://127.0.0.1:9999/test',
+        manifest,
+        commitmentKeypair.secret(),
+      )
+
+      const iterator = handle.stream({ concurrency: 3 })[Symbol.asyncIterator]()
+
+      // Wait a tick so all 3 initial requests are in flight
+      await new Promise((r) => setTimeout(r, 20))
+
+      // Slot 2 rejects BEFORE slot 1 resolves
+      const slot2Error = new Error('Slot 2 network error')
+      d2.reject(slot2Error)
+
+      // Allow microtasks to settle
+      await new Promise((r) => setTimeout(r, 20))
+
+      // Slot 1 resolves successfully
+      d1.resolve(makeOkResponse({ item: 1 }))
+
+      // Consumer reads: slot 1 should succeed
+      const first = await iterator.next()
+      assert.equal(first.done, false)
+      assert.deepEqual(first.value, { item: 1 })
+
+      // Next read: slot 2 error should throw
+      let threw = false
+      try {
+        await iterator.next()
+      } catch (err: any) {
+        threw = true
+        assert.ok(
+          err.message.includes('Slot 2 network error') ||
+            err.message.includes('Voucher request failed'),
+          `Unexpected error message: ${err.message}`,
+        )
+      }
+      assert.ok(threw, 'Expected iterator.next() to throw slot 2 error')
+
+      // Resolve slot 3 so it doesn't linger
+      d3.resolve(makeOkResponse({ item: 3 }))
+      await new Promise((r) => setTimeout(r, 30))
+
+      process.removeListener('unhandledRejection', onUnhandled)
+      assert.equal(
+        unhandled.length,
+        0,
+        `Expected 0 unhandledRejections, got: ${unhandled.map((e: any) => e?.message ?? e).join(', ')}`,
+      )
+      console.log('✓ Test 1: real client with slot 2 rejecting before slot 1 -> 0 unhandledRejections')
+    }
+
+    // ── Test 2 ─────────────────────────────────────────────────────────────────
+    // Break out of for await after first item; subsequent queued fetches later reject.
+    // Must produce 0 unhandledRejection events.
+    {
+      const unhandled: unknown[] = []
+      const onUnhandled = (reason: unknown) => unhandled.push(reason)
+      process.on('unhandledRejection', onUnhandled)
+
+      const d1 = deferred<Response>()
+      const d2 = deferred<Response>()
+      const d3 = deferred<Response>()
+      const defs = [d1, d2, d3]
+      let callCount = 0
+
+      globalThis.fetch = async () => {
+        const d = defs[callCount++] ?? deferred<Response>()
+        return d.promise
+      }
+
+      const handle = await client.openSession(
+        'http://127.0.0.1:9999/test',
+        manifest,
+        commitmentKeypair.secret(),
+      )
+
+      d1.resolve(makeOkResponse({ item: 'first' }))
+
+      for await (const item of handle.stream({ concurrency: 3 })) {
+        assert.deepEqual(item, { item: 'first' })
+        break // Consumer exits early; finally block runs
+      }
+
+      // Remaining queued slots now reject after consumer has already broken out
+      d2.reject(new Error('Late rejection in slot 2'))
+      d3.reject(new Error('Late rejection in slot 3'))
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      process.removeListener('unhandledRejection', onUnhandled)
+      assert.equal(
+        unhandled.length,
+        0,
+        `Expected 0 unhandledRejections on break, got: ${unhandled.map((e: any) => e?.message ?? e).join(', ')}`,
+      )
+      console.log('✓ Test 2: real client breaking out of for await while slots later reject -> 0 unhandledRejections')
+    }
+
+    // ── Test 3 ─────────────────────────────────────────────────────────────────
+    // Head slot rejects while other slots are still in flight.
+    // Error must propagate to consumer, and other in-flight slots must not leak unhandled.
+    {
+      const unhandled: unknown[] = []
+      const onUnhandled = (reason: unknown) => unhandled.push(reason)
+      process.on('unhandledRejection', onUnhandled)
+
+      const d1 = deferred<Response>()
+      const d2 = deferred<Response>()
+      const d3 = deferred<Response>()
+      const defs = [d1, d2, d3]
+      let callCount = 0
+
+      globalThis.fetch = async () => {
+        const d = defs[callCount++] ?? deferred<Response>()
+        return d.promise
+      }
+
+      const handle = await client.openSession(
+        'http://127.0.0.1:9999/test',
+        manifest,
+        commitmentKeypair.secret(),
+      )
+
+      // Head slot rejects immediately
+      d1.reject(new Error('Head slot failed'))
+
+      let threw = false
+      try {
+        for await (const _ of handle.stream({ concurrency: 3 })) {
+          // Should not yield
+        }
+      } catch (err: any) {
+        threw = true
+        assert.ok(
+          err.message.includes('Head slot failed') ||
+            err.message.includes('Voucher request failed'),
+          `Unexpected error: ${err.message}`,
+        )
+      }
+      assert.ok(threw, 'Expected stream to throw on head slot rejection')
+
+      // Other slots subsequently reject
+      d2.reject(new Error('Slot 2 downstream failure'))
+      d3.reject(new Error('Slot 3 downstream failure'))
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      process.removeListener('unhandledRejection', onUnhandled)
+      assert.equal(
+        unhandled.length,
+        0,
+        `Expected 0 unhandledRejections, got: ${unhandled.map((e: any) => e?.message ?? e).join(', ')}`,
+      )
+      console.log('✓ Test 3: real client head slot rejection with in-flight queue -> 0 unhandledRejections')
+    }
+
+    // ── Test 4 ─────────────────────────────────────────────────────────────────
+    // onSpend throws during replenishment; remaining in-flight slots must not leak.
+    {
+      const unhandled: unknown[] = []
+      const onUnhandled = (reason: unknown) => unhandled.push(reason)
+      process.on('unhandledRejection', onUnhandled)
+
+      let spendCount = 0
+      const onSpend = async (_rate: string) => {
+        spendCount++
+        if (spendCount === 3) {
+          throw new Error('Daily spend cap exceeded on replenish')
+        }
+      }
+
+      const d1 = deferred<Response>()
+      const d2 = deferred<Response>()
+      const defs = [d1, d2]
+      let callCount = 0
+
+      globalThis.fetch = async () => {
+        const d = defs[callCount++] ?? deferred<Response>()
+        return d.promise
+      }
+
+      const handle = await client.openSession(
+        'http://127.0.0.1:9999/test',
+        manifest,
+        commitmentKeypair.secret(),
+        undefined,
+        onSpend,
+      )
+
+      // Concurrency 2: calls 1 and 2 checkSpend pass.
+      // Draining slot 1 will call replenish -> checkSpend 3 -> throws.
+      d1.resolve(makeOkResponse({ item: 'one' }))
+
+      let threw = false
+      try {
+        for await (const _ of handle.stream({ concurrency: 2 })) {
+          // First item consumed, next replenishment triggers spend error
+        }
+      } catch (err: any) {
+        threw = true
+        assert.ok(
+          err.message.includes('Daily spend cap exceeded'),
+          `Unexpected error: ${err.message}`,
+        )
+      }
+      assert.ok(threw, 'Expected spend cap error to propagate')
+
+      // Pending slot 2 now rejects
+      d2.reject(new Error('Slot 2 orphan rejection'))
+      await new Promise((r) => setTimeout(r, 50))
+
+      process.removeListener('unhandledRejection', onUnhandled)
+      assert.equal(
+        unhandled.length,
+        0,
+        `Expected 0 unhandledRejections, got: ${unhandled.map((e: any) => e?.message ?? e).join(', ')}`,
+      )
+      console.log('✓ Test 4: real client spend error during replenish -> 0 unhandledRejections')
+    }
+
+    console.log('\nAll stream pipelined rejection tests passed on real MppSessionClient.')
   } finally {
-    process.removeListener('unhandledRejection', listener)
+    globalThis.fetch = originalFetch
   }
 }
 
-// ── Test 1: concurrency: 3 — slot 2 rejects before slot 1 resolves ───────────
-
-await runTest(
-  'Test 1: with concurrency: 3, slot 2 rejects before slot 1 resolves -> 0 unhandledRejections and yields slot 1 then slot 2 error',
-  async () => {
-    const d1 = deferred<{ seq: number }>()
-    const d2 = deferred<{ seq: number }>()
-    const d3 = deferred<{ seq: number }>()
-    const defs = [d1, d2, d3]
-
-    const mock = buildMockStream(() => {
-      const d = defs.shift()
-      if (!d) return Promise.resolve({ seq: 99 })
-      return d.promise
-    })
-
-    const iter = mock.stream({ concurrency: 3 })[Symbol.asyncIterator]()
-
-    // Kick off first item (fills queue with d1, d2, d3)
-    const firstNext = iter.next()
-    await Promise.resolve()
-
-    // Slot 2 rejects while slot 1 is still pending
-    d2.reject(new Error('slot 2 error'))
-    // Settle slot 3 concurrently so allSettled in finally can settle
-    setTimeout(() => d3.resolve({ seq: 3 }), 10)
-    await Promise.resolve()
-
-    // Slot 1 resolves
-    d1.resolve({ seq: 1 })
-    const { value: v1 } = await firstNext
-    assert.deepStrictEqual(v1, { seq: 1 })
-
-    // Next item must throw slot 2's error
-    await assert.rejects(
-      async () => {
-        await iter.next()
-      },
-      (err: Error) => {
-        assert.match(err.message, /slot 2 error/)
-        return true
-      },
-    )
-  },
-)
-
-// ── Test 2: Breaking out of for await after first item ─────────────────────────
-
-await runTest(
-  'Test 2: breaking out of for await after first item, while other slots later reject, produces 0 unhandledRejections',
-  async () => {
-    const d1 = deferred<{ seq: number }>()
-    const d2 = deferred<{ seq: number }>()
-    const d3 = deferred<{ seq: number }>()
-    const defs = [d1, d2, d3]
-
-    const mock = buildMockStream(() => {
-      const d = defs.shift()
-      if (!d) return Promise.resolve({ seq: 99 })
-      return d.promise
-    })
-
-    const results: unknown[] = []
-
-    // Slot 1 resolves immediately
-    d1.resolve({ seq: 1 })
-
-    // Other queued slots reject after a short delay
-    setTimeout(() => {
-      d2.reject(new Error('slot 2 late rejection'))
-      d3.reject(new Error('slot 3 late rejection'))
-    }, 10)
-
-    for await (const item of mock.stream({ concurrency: 3 })) {
-      results.push(item)
-      break // Early exit
-    }
-
-    assert.strictEqual(results.length, 1)
-  },
-)
-
-// ── Test 3: Head slot rejects while other slots in-flight ──────────────────────
-
-await runTest(
-  'Test 3: when head slot rejects while other slots are still in flight, error propagates and 0 unhandledRejections fire',
-  async () => {
-    const d1 = deferred<{ seq: number }>()
-    const d2 = deferred<{ seq: number }>()
-    const defs = [d1, d2]
-
-    const mock = buildMockStream(() => {
-      const d = defs.shift()
-      if (!d) return Promise.resolve({ seq: 99 })
-      return d.promise
-    })
-
-    const iter = mock.stream({ concurrency: 2 })[Symbol.asyncIterator]()
-
-    // Secondary slot rejects slightly later
-    setTimeout(() => {
-      d2.reject(new Error('secondary slot late failure'))
-    }, 10)
-
-    // Reject head slot immediately
-    d1.reject(new Error('head slot failed'))
-
-    await assert.rejects(
-      async () => {
-        await iter.next()
-      },
-      (err: Error) => {
-        assert.match(err.message, /head slot failed/)
-        return true
-      },
-    )
-  },
-)
-
-// ── Test 4: onSpend throws during replenish ────────────────────────────────────
-
-await runTest(
-  'Test 4: when onSpend throws during replenish, spend error propagates and queued slots do not cause unhandledRejection',
-  async () => {
-    const d1 = deferred<{ seq: number }>()
-    const d2 = deferred<{ seq: number }>()
-    const defs = [d1, d2]
-
-    let spendCallCount = 0
-    const onSpend = async () => {
-      spendCallCount++
-      // The initial window of 2 calls checkSpend 2 times. The 3rd call is during replenish.
-      if (spendCallCount > 2) {
-        throw new Error('daily spend cap exceeded on replenish')
-      }
-    }
-
-    const mock = buildMockStream(
-      () => {
-        const d = defs.shift()
-        if (!d) return Promise.resolve({ seq: 99 })
-        return d.promise
-      },
-      onSpend,
-    )
-
-    const iter = mock.stream({ concurrency: 2 })[Symbol.asyncIterator]()
-
-    // Queued slot 2 rejects slightly later
-    setTimeout(() => {
-      d2.reject(new Error('queued slot 2 late rejection'))
-    }, 10)
-
-    // Slot 1 resolves
-    d1.resolve({ seq: 1 })
-
-    // On replenishing the window, checkSpend() throws spend cap error
-    await assert.rejects(
-      async () => {
-        await iter.next()
-      },
-      (err: Error) => {
-        assert.match(err.message, /daily spend cap exceeded on replenish/)
-        return true
-      },
-    )
-  },
-)
-
-console.log('\nAll stream pipelined rejection tests passed.')
+await runTests()
