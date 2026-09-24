@@ -19,7 +19,7 @@
 import assert from 'node:assert/strict'
 import { Keypair } from '@stellar/stellar-sdk'
 import { MppSessionClient } from '../MppSessionClient.js'
-import type { RouteDockManifest } from '../../types.js'
+import { signManifest } from '../../manifest/sign.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,20 +43,31 @@ const clientKeypair = Keypair.random()
 const commitmentKeypair = Keypair.random()
 const client = new MppSessionClient(clientKeypair, 'testnet', { maxAttempts: 1 })
 
-const manifest: RouteDockManifest = {
-  version: '1',
-  name: 'test-agent',
-  payee: Keypair.random().publicKey(),
-  pricing: {
-    'mpp-session': {
-      rate: '0.0001',
-      per: 'voucher',
-      channel_factory: 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH',
-      min_deposit: '0.10',
-      refund_waiting_period_ledgers: 17280,
+const payeeKeypair = Keypair.random()
+const manifest = signManifest(
+  {
+    routedock: '1.0',
+    name: 'test-agent',
+    description: 'Test agent for stream pipelining',
+    modes: ['mpp-session'],
+    network: 'testnet',
+    asset: 'USDC',
+    asset_contract: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+    payee: payeeKeypair.publicKey(),
+    pricing: {
+      'mpp-session': {
+        rate: '0.0001',
+        per: 'voucher',
+        channel_factory: 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
     },
+    endpoints: { test: { method: 'GET', path: '/test' } },
+    tags: ['test'],
   },
-}
+  payeeKeypair.secret(),
+)
 
 function makeOkResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
