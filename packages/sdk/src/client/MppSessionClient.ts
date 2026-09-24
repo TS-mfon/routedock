@@ -277,18 +277,27 @@ export class MppSessionClient {
           // sequence integrity. The caller opts in knowing the provider supports
           // concurrent vouchers.
           const queue: Array<Promise<unknown>> = []
-          for (let i = 0; i < concurrency; i++) {
-            await checkSpend()
-            queue.push(doFetch())
-          }
+          try {
+            for (let i = 0; i < concurrency; i++) {
+              await checkSpend()
+              const p = doFetch()
+              p.catch(() => {})
+              queue.push(p)
+            }
 
-          while (true) {
-            const data = await queue.shift()!
-            // Replenish the window immediately after draining one slot.
-            await checkSpend()
-            queue.push(doFetch())
-            vouchersIssued++
-            yield data
+            while (true) {
+              const data = await queue.shift()!
+              // Replenish the window immediately after draining one slot.
+              await checkSpend()
+              const p = doFetch()
+              p.catch(() => {})
+              queue.push(p)
+              vouchersIssued++
+              yield data
+            }
+          } finally {
+            await Promise.allSettled(queue)
+            queue.length = 0
           }
         }
       },
