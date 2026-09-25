@@ -158,8 +158,12 @@ describe('RouteDockClient — Trustline issuer enforcement', () => {
       wallet: payerKeypair,
     })
 
+    const cacheKey = `testnet:${payerKeypair.publicKey()}:CUSTOM`
+    const cache = (RouteDockClient as unknown as { _trustlineCache: Map<string, { exists: boolean }> })._trustlineCache
+
     const result = await client.preflight(manifest)
     assert.equal(result.hasTrustline, true)
     assert.equal(result.asset, 'CUSTOM')
+    assert.equal(cache.has(cacheKey), true)
   })
 })
