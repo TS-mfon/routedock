@@ -32,6 +32,7 @@ import {
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
 
 const MIN_REFUND_WAITING_PERIOD = 17_280
+const STREAM_CLEANUP_TIMEOUT_MS = 3_000
 
 /** WebSocket-readyState values (mirrors the WHATWG WebSocket constants). */
 const WS_CONNECTING = 0
@@ -306,10 +307,20 @@ export class MppSessionClient {
           } finally {
             abortController.abort()
             // Bound cleanup so hanging requests cannot stall consumer loop indefinitely
-            await Promise.race([
-              Promise.allSettled(queue),
-              new Promise((resolve) => setTimeout(resolve, 3000)),
-            ])
+            let timer: ReturnType<typeof setTimeout> | undefined
+            try {
+              await Promise.race([
+                Promise.allSettled(queue),
+                new Promise((resolve) => {
+                  timer = setTimeout(resolve, STREAM_CLEANUP_TIMEOUT_MS)
+                  timer.unref?.()
+                }),
+              ])
+            } finally {
+              if (timer) {
+                clearTimeout(timer)
+              }
+            }
             queue.length = 0
           }
         }

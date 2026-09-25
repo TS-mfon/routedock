@@ -76,6 +76,23 @@ function makeOkResponse(body: unknown): Response {
   })
 }
 
+function createMockFetch(defs: { promise: Promise<Response>; resolve: (v: Response) => void; reject: (e: unknown) => void }[]) {
+  let callCount = 0
+  return async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const d = defs[callCount++] ?? deferred<Response>()
+    if (init?.signal) {
+      if (init.signal.aborted) {
+        d.reject(new DOMException('This operation was aborted', 'AbortError'))
+      } else {
+        init.signal.addEventListener('abort', () => {
+          d.reject(new DOMException('This operation was aborted', 'AbortError'))
+        })
+      }
+    }
+    return d.promise
+  }
+}
+
 // ── Test Runner ───────────────────────────────────────────────────────────────
 
 async function runTests() {
@@ -95,12 +112,7 @@ async function runTests() {
       const d2 = deferred<Response>()
       const d3 = deferred<Response>()
       const defs = [d1, d2, d3]
-      let callCount = 0
-
-      globalThis.fetch = async () => {
-        const d = defs[callCount++] ?? deferred<Response>()
-        return d.promise
-      }
+      globalThis.fetch = createMockFetch(defs)
 
       const handle = await client.openSession(
         'http://127.0.0.1:9999/test',
@@ -167,12 +179,7 @@ async function runTests() {
       const d2 = deferred<Response>()
       const d3 = deferred<Response>()
       const defs = [d1, d2, d3]
-      let callCount = 0
-
-      globalThis.fetch = async () => {
-        const d = defs[callCount++] ?? deferred<Response>()
-        return d.promise
-      }
+      globalThis.fetch = createMockFetch(defs)
 
       const handle = await client.openSession(
         'http://127.0.0.1:9999/test',
@@ -214,12 +221,7 @@ async function runTests() {
       const d2 = deferred<Response>()
       const d3 = deferred<Response>()
       const defs = [d1, d2, d3]
-      let callCount = 0
-
-      globalThis.fetch = async () => {
-        const d = defs[callCount++] ?? deferred<Response>()
-        return d.promise
-      }
+      globalThis.fetch = createMockFetch(defs)
 
       const handle = await client.openSession(
         'http://127.0.0.1:9999/test',
@@ -278,12 +280,7 @@ async function runTests() {
       const d1 = deferred<Response>()
       const d2 = deferred<Response>()
       const defs = [d1, d2]
-      let callCount = 0
-
-      globalThis.fetch = async () => {
-        const d = defs[callCount++] ?? deferred<Response>()
-        return d.promise
-      }
+      globalThis.fetch = createMockFetch(defs)
 
       const handle = await client.openSession(
         'http://127.0.0.1:9999/test',
