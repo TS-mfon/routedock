@@ -96,59 +96,59 @@ describe('SupabaseSessionStore', () => {
   })
 
   it('upsert() sends non-null values for NOT NULL columns (channel_id, payee, payer, channel_contract) and network', async () => {
-    let capturedPayload: Record<string, unknown> | null = null
+    const upserts: Record<string, unknown>[] = []
     const store = new SupabaseSessionStore(
       mockSupabase({
         data: null,
         onUpsert: (payload) => {
-          capturedPayload = payload
+          upserts.push(payload)
         },
       }),
     )
 
     await store.upsert('channel_123', sampleState)
 
-    assert.ok(capturedPayload)
-    assert.ok((capturedPayload as any).channel_id, 'channel_id must not be null/undefined')
-    assert.ok((capturedPayload as any).payee, 'payee must not be null/undefined')
-    assert.ok((capturedPayload as any).payer, 'payer must not be null/undefined')
-    assert.ok((capturedPayload as any).channel_contract, 'channel_contract must not be null/undefined')
-    assert.equal((capturedPayload as any).channel_contract, 'CCONTRACT123')
-    assert.equal((capturedPayload as any).network, 'testnet')
-    assert.equal((capturedPayload as any).channel_id, 'channel_123')
+    assert.equal(upserts.length, 1)
+    const payload = upserts[0]
+    assert.ok(payload)
+    assert.ok(payload.channel_id, 'channel_id must not be null/undefined')
+    assert.ok(payload.payee, 'payee must not be null/undefined')
+    assert.ok(payload.payer, 'payer must not be null/undefined')
+    assert.ok(payload.channel_contract, 'channel_contract must not be null/undefined')
+    assert.equal(payload.channel_contract, 'CCONTRACT123')
+    assert.equal(payload.network, 'testnet')
+    assert.equal(payload.channel_id, 'channel_123')
   })
 
   it('setStatus() calls update with a payload that has no cumulative_amount key', async () => {
-    let capturedPayload: Record<string, unknown> | null = null
-    let capturedEqField: string | null = null
-    let capturedEqVal: string | null = null
+    const updates: { payload: Record<string, unknown>; eqField?: string | undefined; eqVal?: string | undefined }[] = []
     const store = new SupabaseSessionStore(
       mockSupabase({
         onUpdate: (payload, eqField, eqVal) => {
-          capturedPayload = payload
-          capturedEqField = eqField ?? null
-          capturedEqVal = eqVal ?? null
+          updates.push({ payload, eqField, eqVal })
         },
       }),
     )
 
     await store.setStatus('channel_123', 'closing')
 
-    assert.ok(capturedPayload)
-    assert.equal('cumulative_amount' in capturedPayload, false)
-    assert.equal((capturedPayload as any).status, 'closing')
-    assert.ok((capturedPayload as any).updated_at)
-    assert.equal(capturedEqField, 'channel_id')
-    assert.equal(capturedEqVal, 'channel_123')
+    assert.equal(updates.length, 1)
+    const update = updates[0]
+    assert.ok(update)
+    assert.equal('cumulative_amount' in update.payload, false)
+    assert.equal(update.payload.status, 'closing')
+    assert.ok(update.payload.updated_at)
+    assert.equal(update.eqField, 'channel_id')
+    assert.equal(update.eqVal, 'channel_123')
   })
 
   it('moving a stored session from open to closing at an unchanged amount resolves without throwing', async () => {
-    let capturedPayload: Record<string, unknown> | null = null
+    const updates: Record<string, unknown>[] = []
     const store = new SupabaseSessionStore(
       mockSupabase({
         data: sampleRow,
         onUpdate: (payload) => {
-          capturedPayload = payload
+          updates.push(payload)
         },
       }),
     )
@@ -156,43 +156,63 @@ describe('SupabaseSessionStore', () => {
     await assert.doesNotReject(async () => {
       await store.setStatus('channel_123', 'closing')
     })
-    assert.equal((capturedPayload as any)?.status, 'closing')
-    assert.equal('cumulative_amount' in (capturedPayload ?? {}), false)
+    assert.equal(updates.length, 1)
+    const payload = updates[0]
+    assert.ok(payload)
+    assert.equal(payload.status, 'closing')
+    assert.equal('cumulative_amount' in payload, false)
   })
 
   it('setStatus() writes settlement_tx_hash when one is passed', async () => {
-    let capturedPayload: Record<string, unknown> | null = null
+    const updates: Record<string, unknown>[] = []
     const store = new SupabaseSessionStore(
       mockSupabase({
         onUpdate: (payload) => {
-          capturedPayload = payload
+          updates.push(payload)
         },
       }),
     )
 
     await store.setStatus('channel_123', 'closed', 'tx_settled_hash_999')
 
-    assert.ok(capturedPayload)
-    assert.equal((capturedPayload as any).status, 'closed')
-    assert.equal((capturedPayload as any).settlement_tx_hash, 'tx_settled_hash_999')
-    assert.equal('cumulative_amount' in capturedPayload, false)
+    assert.equal(updates.length, 1)
+    const payload = updates[0]
+    assert.ok(payload)
+    assert.equal(payload.status, 'closed')
+    assert.equal(payload.settlement_tx_hash, 'tx_settled_hash_999')
+    assert.equal('cumulative_amount' in payload, false)
+  })
+
+  it('setStatus() rejects with RouteDockNetworkError when update fails', async () => {
+    const store = new SupabaseSessionStore(
+      mockSupabase({
+        updateError: 'database unreachable',
+      }),
+    )
+
+    await assert.rejects(
+      () => store.setStatus('channel_123', 'closing'),
+      RouteDockNetworkError,
+    )
   })
 
   it('close() sends status: closed and no cumulative_amount', async () => {
-    let capturedPayload: Record<string, unknown> | null = null
+    const updates: Record<string, unknown>[] = []
     const store = new SupabaseSessionStore(
       mockSupabase({
         onUpdate: (payload) => {
-          capturedPayload = payload
+          updates.push(payload)
         },
       }),
     )
 
     await store.close('channel_123')
 
-    assert.ok(capturedPayload)
-    assert.equal((capturedPayload as any).status, 'closed')
-    assert.equal('cumulative_amount' in capturedPayload, false)
+    assert.equal(updates.length, 1)
+    const payload = updates[0]
+    assert.ok(payload)
+    assert.equal(payload.status, 'closed')
+    assert.equal('cumulative_amount' in payload, false)
   })
 
   it('upsert() rejects with RouteDockVoucherMonotonicityError when cumulative_amount <= stored, without calling client upsert', async () => {
@@ -213,10 +233,7 @@ describe('SupabaseSessionStore', () => {
           ...sampleState,
           cumulative_amount: '0.0050000',
         }),
-      (err: Error) => {
-        assert.equal(err.name, 'RouteDockVoucherMonotonicityError')
-        return true
-      },
+      RouteDockVoucherMonotonicityError,
     )
     assert.equal(upsertCalled, false)
 
@@ -227,10 +244,7 @@ describe('SupabaseSessionStore', () => {
           ...sampleState,
           cumulative_amount: '0.0040000',
         }),
-      (err: Error) => {
-        assert.equal(err.name, 'RouteDockVoucherMonotonicityError')
-        return true
-      },
+      RouteDockVoucherMonotonicityError,
     )
     assert.equal(upsertCalled, false)
   })
